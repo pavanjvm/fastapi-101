@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
 
@@ -19,5 +19,7 @@ def health() -> dict[str,str]:
 @app.get("/users/{user_id}")
 def read_user(user_id: int, session: Session = Depends(get_session)):
     user = session.get(User,user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
     return {"id": user.id, "name": user.name}
 

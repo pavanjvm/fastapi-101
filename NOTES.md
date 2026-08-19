@@ -341,5 +341,165 @@ The SQL lands between those two log lines because that's exactly where `init_db(
 
 `/openapi.json` reported `"title": "Ctrl+Teach API (dev)"` — the `(dev)` proves `.env` → `settings` → live app.
 
+---
+
+## L8 — The endpoint (path params + `Depends`)
+
+```python
+@app.get("/users/{user_id}")
+def read_user(user_id: int, session: Session = Depends(get_session)):
+    user = session.get(User, user_id)
+    return {"id": user.id, "name": user.name}
+```
+
+### Problem 1: the URL carries data
+`/users/1` and `/users/7` are the same operation with a different input — so part of the URL is an **argument**, not an address. `{user_id}` marks the hole, and **the name in the braces must match the parameter name** — that's the whole binding mechanism.
+
+### Problem 2: everything off the wire is a string
+HTTP has no types. `"1"` arrives as bytes; `/users/abc` is equally valid HTTP. Without the framework, every endpoint opens with the same boilerplate:
+
+```python
+try:
+    user_id = int(user_id)
+except ValueError:
+    return JSONResponse({"detail": "..."}, status_code=422)
+```
+
+FastAPI's move: **you already write the type down anyway.** `user_id: int` generates the conversion *and* the 422. Same trick as `Mapped[int]` — **declare the shape, get the enforcement free.** That's the core idea of the entire framework.
+
+### Problem 3: why not one global Session?
+```python
+session = SessionLocal()   # module level — badly broken
+```
+Three failures, each following from what a Session *is*:
+
+| A Session is... | ...so sharing it means |
+|---|---|
+| one **transaction** | Bob sees Alice's uncommitted rows; her rollback reverts his work |
+| an **identity map** (caches loaded rows) | nothing ever refreshes — permanent stale reads |
+| **not thread-safe** | sync `def` handlers run in a threadpool → concurrent mutation, intermittent corruption under load |
+
+Forced conclusion: **one session per request**, shared with nobody.
+
+### Problem 4: so who builds it?
+Doing it inline is *correct*:
+```python
+with SessionLocal() as session:      # fine! but...
+```
+…it gets copy-pasted into all 40 endpoints, hard-wires each one to `SessionLocal` (so testing needs monkey-patching), and once auth/permissions/rate-limits each bring their own `with`, endpoints become nested boilerplate with two real lines at the bottom.
+
+The insight: **setup/teardown isn't the endpoint's job.** It doesn't want to *build* a session, it wants to *be given* one. The framework is already wrapping the call — let it. And you already have a place listing what a function needs: **the parameter list.**
+
+```python
+session: Session = Depends(get_session)   # "don't expect a caller to pass this — run this and give me what it yields"
+```
+
+**No parentheses.** `Depends(get_session())` would call it once at import → the global-session bug with extra steps.
+
+### The two params are unrelated
+| Parameter | Source |
+|---|---|
+| `user_id: int` | the **URL** (name matches `{user_id}`) |
+| `session: Session` | the **`Depends`** — nothing to do with the URL |
+
+FastAPI reads the signature **once at startup** and builds a plan; nothing is guessed per request:
+```
+"1" → int → 1                 (or 422, and you're never called)
+g = get_session() → next(g)   session opens ⏸
+    read_user(1, session)     ← the only line you wrote
+                 next(g)      session closes
+```
+
+### ✅ Verified live
+| Request | Result |
+|---|---|
+| `/users/1` | **200** `{"id":1,"name":"changed"}` |
+| `/users/abc` | **422** `{"loc":["path","user_id"],"msg":"Input should be a valid integer","input":"abc"}` — precise, machine-readable, free |
+| `/users/999` | **500** `AttributeError: 'NoneType' object has no attribute 'id'` |
+
+The SQL emitted:
+```sql
+SELECT users.id, users.name FROM users WHERE users.id = ?
+```
+**`= ?`** — the value is sent separately, never parsed as SQL. A `user_id` of `1; DROP TABLE users` is only ever *compared*, never executed. SQL injection is **structurally** impossible, not just unlikely.
+
+On the 999 case: the query ran fine and returned zero rows. **The DB was happy** — the failure was purely Python assuming a row came back.
+
 ### 🔜 Next up
-The endpoint. Nothing touches the DB *during a request* yet. Then: `/users/999` returns **500** (`AttributeError` on `None`) because `session.get` returns `None` for a missing row → `HTTPException(404)`.
+L9 — turning that 500 into a 404 with `HTTPException`.
+
+---
+
+## L9 — From a crash to an API (`HTTPException`)
+
+```python
+from fastapi import Depends, FastAPI, HTTPException
+
+@app.get("/users/{user_id}")
+def read_user(user_id: int, session: Session = Depends(get_session)):
+    user = session.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"id": user.id, "name": user.name}
+```
+
+### What actually happened
+`session.get` returns **`None`** for a missing row — not an error, not an empty object. Then `.id` on `None` raises `AttributeError`, nothing catches it, FastAPI's top-level net converts it to 500.
+
+Why doesn't FastAPI handle it? Because **`None` is only meaningful to you.** The framework sees a function that raised; it can't know whether that meant "row missing" or "database on fire."
+
+### Why 500 is a lie
+Status codes are a **contract**, and the first digit is the whole message:
+
+| | Meaning | Whose fault |
+|---|---|---|
+| 2xx | worked | — |
+| 4xx | bad request | **client's** |
+| 5xx | I broke | **server's** |
+
+`/users/999` is a well-formed request for a row that doesn't exist → **404**. Machines act on that digit:
+
+- **Monitoring pages someone** — 5xx rate is the classic alert. A URL typo wakes someone at 3am.
+- **Clients retry** on 5xx ("transient, try again"). It'll fail identically forever. 404 means "settled, don't bother."
+- **The frontend can't respond properly** — "user not found" vs "try again later." Only one is true.
+- An unhandled 500 in debug mode can **leak the stack trace** — paths, versions, SQL — to whoever asked.
+
+> **A crash and an error are different things.** A crash is unplanned; an error is a documented outcome you designed. Converting the first into the second is most of what "production-ready" means.
+
+### ⚠ The wrong fix
+```python
+return {"error": "user not found"}      # ← this is 200 OK
+```
+You've said *"success, here's your user"* and attached an error message. Every client checks the status, sails past, and crashes later on a missing field far from the cause. **Never signal failure in the body while the status says success.**
+
+### Why `raise`, not `return`
+`return JSONResponse(..., status_code=404)` works fine for a 2-line endpoint. But `return` exits **one function**, and real code has depth:
+
+```
+read_user() → get_user_with_permissions() → load_user()   ← discovers it's missing HERE
+```
+
+Every intermediate layer would need error-checking code for a problem it has nothing to do with, and one missed check lets the `None` travel until it crashes somewhere unrelated (**exactly what happened in L8**).
+
+An exception is a **non-local exit** — it unwinds the stack until something catches it. FastAPI puts a catcher at the top listening for `HTTPException`. So: *abort with this status, from any depth, no intermediate cooperation required.*
+
+### Details worth keeping
+- **`is None`, not `if not user`** — `not user` is also true for `""`, `0`, `[]`. Test for what you actually mean; it'll bite the day the value is legitimately `0`.
+- **Guard clause first**, happy path unindented below. Beats an `else` once there are four checks and you'd be four levels deep.
+- **422 you never wrote** (generated from `user_id: int`); **404 you had to write** — only you know what a missing row means. That's the line between what a framework can infer and what it can't.
+
+### ⚠ Bugs in error handlers hide
+Forgetting to import `HTTPException` gives a `NameError` — but only inside the `if`, so the app boots, `/users/1` works, and the failure appears *only* when a user is missing → **a 500 again**, from a totally different cause. **Error-path bugs only fire on the error path, which is the path nobody exercises.**
+
+### ✅ Verified live
+| Request | Status | Body |
+|---|---|---|
+| `/users/1` | **200** | `{"id":1,"name":"changed"}` |
+| `/users/999` | **404** | `{"detail":"user not found"}` |
+| `/users/abc` | **422** | validation detail |
+| `/health` | **200** | `{"status":"ok"}` |
+
+**Zero tracebacks in the log** — the real signal. Before, a missing user printed a full stack trace ("nobody anticipated this"). Now the log stays quiet, because nothing went wrong.
+
+### 🔜 Next up
+`response_model`. `return {"id": ..., "name": ...}` hides a flaw that's invisible with two columns and becomes a security problem the moment `User` grows a `password_hash`.
