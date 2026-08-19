@@ -1,15 +1,23 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
+from contextlib import asynccontextmanager
+from sqlalchemy.orm import Session
 
+from app.db import User,get_session, init_db
+from app.config import settings
 
-from app.routers.health import router as health_router
-from app.routers.users import router as users_router
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
 
+app = FastAPI(title = settings.app_name, lifespan=lifespan)
 
-app = FastAPI(title = "Ctrl+Teach API")
+@app.get("/health")
+def health() -> dict[str,str]:
+    return {"status":"ok"}
 
-app.include_router(health_router)
-app.include_router(users_router)
+@app.get("/users/{user_id}")
+def read_user(user_id: int, session: Session = Depends(get_session)):
+    user = session.get(User,user_id)
+    return {"id": user.id, "name": user.name}
 
-
-
-    

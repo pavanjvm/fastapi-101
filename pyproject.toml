@@ -1,10 +1,10 @@
 [project]
-name = "ctrlteach-backend-journey"
+name = "fastapi-101"
 version = "0.1.0"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 dependencies = [
-    "fastapi==0.139.0",
-    "pydantic-settings==2.14.2",
-    "sqlalchemy>=2.0",
-    "uvicorn[standard]==0.41.0",
+    "fastapi>=0.141.1",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy>=2.0.52",
+    "uvicorn[standard]>=0.52.3",
 ]
