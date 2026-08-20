@@ -503,3 +503,197 @@ Forgetting to import `HTTPException` gives a `NameError` — but only inside the
 
 ### 🔜 Next up
 `response_model`. `return {"id": ..., "name": ...}` hides a flaw that's invisible with two columns and becomes a security problem the moment `User` grows a `password_hash`.
+
+---
+
+## L10 — Output contracts with `response_model`
+
+Returning a hand-built dictionary is safe but fragile:
+
+```python
+return {"id": user.id, "name": user.name}
+```
+
+Every endpoint author must remember every sensitive field forever. The tempting shortcut is worse:
+
+```python
+return user
+```
+
+FastAPI then serializes the whole ORM object. After adding and seeding a non-empty `password_hash`, the actual 85-byte response was:
+
+```json
+{"password_hash":"L10_SUPER_SECRET_HASH_DO_NOT_EXPOSE","id":3,"name":"L10 Leak Demo"}
+```
+
+The fix is one reusable, explicit output allow-list:
+
+```python
+from pydantic import BaseModel
+
+class UserOut(BaseModel):
+    id: int
+    name: str
+
+    model_config = {"from_attributes": True}
+```
+
+`from_attributes=True` lets Pydantic obtain those fields from `user.id` and `user.name` instead of requiring a dictionary. It does **not** activate the protection; the route must enforce the model:
+
+```python
+@app.get("/users/{user_id}", response_model=UserOut)
+def read_user(...):
+    ...
+    return user
+```
+
+`response_model` now sits between the returned object and the network: validate the declared fields, discard everything else, then serialize.
+
+### ✅ Verified live
+
+The same database query still selected `users.password_hash`, so the ORM object still contained the secret. But the protected HTTP body was only 31 bytes:
+
+```json
+{"id":3,"name":"L10 Leak Demo"}
+```
+
+The secret disappeared because `UserOut` did not permit it—not because the endpoint author manually remembered to remove it.
+
+### 🔜 Next up
+Flesh out `User`, then add its one-to-one `Profile` model.
+
+---
+
+## L11 — Modeling a real `User`
+
+A database model records invariants, not just fields. The completed user separates:
+
+- required identity/auth data: `id`, unique indexed `username`, `password_hash`
+- optional account data: `email`, `name`, `picture`, `timezone`, `last_login`
+- server-owned data: `is_admin=False` and a per-row UTC `created_at`
+
+`NULL` means “no value”; it is different from the present-but-empty string `""`. SQLAlchemy derives the same rule from the Python type: `Mapped[str]` is not nullable, while `Mapped[str | None]` is nullable.
+
+Defaults and nullability answer separate questions: a default supplies an omitted value; `nullable` controls whether the stored value may be absent. `password_hash` therefore has no empty default—forgetting it must fail instead of creating a broken account.
+
+Timestamp defaults receive a callable:
+
+```python
+default=lambda: datetime.now(timezone.utc)
+```
+
+Using `default=datetime.now(...)` would calculate one timestamp at import time and reuse that stale value.
+
+### ✅ Verified live
+
+Fresh `CREATE TABLE` SQL contained `NOT NULL` only for required fields and created `CREATE UNIQUE INDEX ix_users_username`. Inserting `pavan` generated `is_admin=False`, a current UTC `created_at`, and `NULL` optional values. A second `pavan` insert rolled back with:
+
+```text
+IntegrityError: UNIQUE constraint failed: users.username
+```
+
+### 🔜 Next up
+L12 — model a one-to-one `Profile` and enforce that every user can have at most one.
+
+---
+
+## L12 — One user, one `Profile`
+
+`User` holds account/authentication data; `Profile` holds optional learning data such as bio, grade, school, languages, and preferences. The tables connect through a shared key:
+
+```text
+profiles.user_id ──→ users.id
+```
+
+Two database rules give that arrow its meaning:
+
+```python
+user_id: Mapped[int] = mapped_column(
+    ForeignKey("users.id"),  # the referenced user must exist
+    primary_key=True,        # a user_id may appear only once here
+)
+```
+
+A foreign key alone would allow several profiles to point at one user. Making `user_id` the profile's primary key enforces at most one profile per user and removes the need for a separate profile ID.
+
+Lists and dictionaries are stored as JSON. Their defaults are factories:
+
+```python
+languages: Mapped[list[str]] = mapped_column(JSON, default=list)
+preferences: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+```
+
+`default=list` hands SQLAlchemy the list-making function, so each profile receives a fresh `[]`; `default=[]` would hand it one already-created mutable object.
+
+### SQLite foreign-key trap
+
+The first live test found `PRAGMA foreign_keys = 0`: SQLite recorded the foreign key in `CREATE TABLE` but did not enforce it. Because the setting belongs to each connection, the engine now runs this whenever it opens one:
+
+```python
+@event.listens_for(engine, "connect")
+def enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+```
+
+### ✅ Verified live
+
+```text
+PRAGMA foreign_keys = 1
+orphan user_id=999       → IntegrityError: FOREIGN KEY constraint failed
+second profile for user 1 → IntegrityError: UNIQUE constraint failed: profiles.user_id
+profile 1 languages      → []
+profile 2 languages      → []
+same languages box       → False
+```
+
+### 🔜 Next up
+L13 — password hashing: why plaintext and reversible encryption both fail.
+
+---
+
+## L13 — Password hashing with Argon2
+
+Plaintext storage exposes every password as soon as the database leaks. Reversible encryption still requires the server to hold a decryption key, so stealing the database and key reveals the originals. Login only needs to answer “does this password match?”, so passwords use a one-way hash.
+
+An ordinary fast hash is unsuitable because attackers can test guesses extremely quickly. A password hasher is deliberately expensive. It also adds a different random salt for every hash, preventing identical passwords from producing identical stored strings and defeating reusable precomputed tables.
+
+The new backend uses the current FastAPI-recommended stack:
+
+```text
+pwdlib  → Python password-hashing interface
+Argon2  → slow, memory-intensive hashing algorithm
+```
+
+Installed with:
+
+```bash
+uv add "pwdlib[argon2]"
+```
+
+`app/security.py` owns the policy behind one application-level doorway:
+
+```python
+from pwdlib import PasswordHash
+
+password_hasher = PasswordHash.recommended()
+
+def hash_password(password: str) -> str:
+    return password_hasher.hash(password)
+```
+
+### ✅ Verified live
+
+Hashing the same password twice produced two different `$argon2id$...` strings because each received a fresh salt:
+
+```text
+hashes equal:     False
+correct password: True
+wrong password:   False
+```
+
+The password hash stays in the database and is never sent to the client. JWTs solve a later, different problem: proving that a login already succeeded.
+
+### 🔜 Next up
+L14 — `/register`: validate plaintext input, hash it, and create `User` + `Profile` in one transaction.
