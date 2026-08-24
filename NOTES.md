@@ -695,5 +695,186 @@ wrong password:   False
 
 The password hash stays in the database and is never sent to the client. JWTs solve a later, different problem: proving that a login already succeeded.
 
+---
+
+## L14 — `/register`
+
+### The problem
+Turn untrusted JSON into a row, without the plaintext password ever reaching the database.
+
+### Two schemas, not one
+`UserOut` is the outgoing shape. Registration needs an incoming one — and it carries a
+plaintext password that must never appear in a response.
+
+```python
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
+```
+
+Bare `str` only means "it's text" — `{"username": "", "password": ""}` would pass. The
+low-level fix is `if len(...) < 8: raise HTTPException(...)` inside the route, but then the
+rule lives in the route, repeats for every route, and never shows up in the OpenAPI docs.
+
+`Field()` attaches the constraint to the annotation itself, so Pydantic builds it into the
+validator and FastAPI returns 422 **before the function body runs**.
+
+`max_length` on a password is not cosmetic: Argon2's cost scales with input size, so an
+uncapped field lets someone POST 10 MB and burn CPU.
+
+### Gotcha — unknown kwargs fail silently
+`Field(min_lenght=3)` does not raise. Pydantic v2 treats an unrecognised keyword as extra
+JSON-schema metadata, so the constraint is simply never enforced.
+
+### The route
+
+```python
+@app.post("/register", response_model=UserOut, status_code=201)
+def register(payload: UserCreate, session: Session = Depends(get_session)):
+    user = User(
+        username=payload.username,
+        password_hash=hash_password(payload.password),
+    )
+    session.add(user)
+    session.commit()
+    return user
+```
+
+- A Pydantic model as a parameter → FastAPI reads it from the **body**. A scalar matching a
+  path placeholder (`user_id: int`) → read from the **path**.
+- `201` means "I created something"; `200` means "here's what you asked for".
+- `hash_password` runs before `session.add`, so the plaintext only ever exists as a local
+  variable and cannot accidentally be persisted.
+
+### Gotcha — `=` vs `:`
+`payload = UserCreate` is a *default value* (the class object itself), not an annotation.
+FastAPI then sees an untyped parameter and never reads the body at all.
+
+---
+
+## L15 — Migrations (Alembic)
+
+### The problem, concretely
+`ctrlteach.db` on disk said `users: id, name`. `app/db.py` said `users: id, username,
+password_hash, ...`. They disagreed, so any INSERT would hit "no such column".
+
+`create_all()` cannot fix this. It creates **missing tables** and never alters an existing
+one. It is not a migration system.
+
+### Deriving the tool
+Fixing it by hand is one line:
+
+```sql
+ALTER TABLE users ADD COLUMN password_hash VARCHAR(255);
+```
+
+That works — on *one* database. But there's also a teammate's, staging, and production.
+So write the change to a committed file instead, and `git pull` carries it to everyone.
+
+**That file is a migration.** Nothing more.
+
+The only hard part: how does a given database know which files it already ran? It
+remembers, in one extra table:
+
+```text
+alembic_version:  abc123
+```
+
+So `alembic upgrade head` = read the bookmark, find the newest revision, run everything
+between in order, update the bookmark.
+
+### ORM vs migrator
+SQLAlchemy maps objects to rows **at runtime** and assumes the table already has the right
+shape. Alembic changes that shape **at deploy time**. Drizzle bundles both halves
+(`drizzle-orm` + `drizzle-kit`); same split, one brand name.
+
+| Drizzle | SQLAlchemy |
+|---|---|
+| `drizzle-kit generate` | `alembic revision --autogenerate` |
+| `drizzle-kit migrate` | `alembic upgrade head` |
+| `meta/_journal.json` | `alembic_version` table |
+
+The migrator needs the schema's **history**, not just its current state — a different kind
+of state, which is why it lives in the DB rather than in the code.
+
+### Setup
+
+```bash
+uv add alembic
+uv run alembic init alembic
+```
+
+`alembic/env.py` ships as a file *you own*, because Alembic can't guess two things:
+
+```python
+from app.config import settings
+from app.db import Base
+
+config = context.config
+config.set_main_option("sqlalchemy.url", settings.database_url)
+...
+target_metadata = Base.metadata
+```
+
+- **Where the models are.** Autogenerate diffs `Base.metadata` against the live DB; the stub
+  ships `target_metadata = None`, so every diff comes out empty. Importing `app.db` also
+  *executes* it, which is what runs `class User(Base)` and registers the table. **A model in
+  a file nothing imports is invisible to autogenerate** — and may get dropped by it.
+- **Which database.** `sqlalchemy.url` in `alembic.ini` is blanked deliberately: the URL
+  belongs in `.env` via `app/config.py`. Two sources of truth drift, and `alembic.ini` is
+  committed, so a prod URL with a password would land in Git.
+
+`poolclass=pool.NullPool` in the stub: a migration opens one connection and exits. A pool
+exists to reuse connections across many requests; a one-shot script has no use for one.
+
+### Backfilling existing rows
+Autogenerate knows the shape you want, never what old rows should contain. Three cases:
+
+1. **A sensible default exists** — `server_default="UTC"`, and the database fills every row
+   during the ALTER. Note `default=` in `db.py` is *Python-side*: SQLAlchemy applies it when
+   you construct an object, so it does nothing for rows that already exist.
+2. **Value must be computed** — add nullable → `op.execute("UPDATE ...")` → `alter_column`
+   to `NOT NULL`. This is why migrations are Python, not plain SQL. On a large table the
+   UPDATE gets batched rather than run as one table-locking transaction.
+3. **No right answer** — leave it nullable. `NULL` honestly means "unknown"; inventing a
+   value to satisfy a constraint fills the DB with `""` and `1970-01-01`.
+
+### Deploys are not atomic — expand then contract
+
+```text
+deploy 1:  add column (nullable)     old code ignores it
+deploy 2:  ship code that writes it; backfill old rows
+deploy 3:  NOT NULL; drop old column
+```
+
+Each step is safe with either version of the code live. Dropping is the dangerous
+direction: the moment the column is gone, any still-running old instance that selects it
+throws.
+
+### Rules
+- A schema change and its migration go in **the same commit**. Model without migration =
+  every teammate's `upgrade head` is a no-op and their app crashes on a stale table.
+- Migrations are **append-only once pushed**. Editing an applied revision leaves other DBs
+  claiming a version they don't actually have.
+- Renames autogenerate as **drop + add** — harmless on an empty column, data loss on a
+  teammate's DB. Always read the generated file before running it.
+- `init_db()` / `create_all()` must come out of the lifespan once Alembic owns the schema.
+  On a fresh DB `create_all()` builds the tables without stamping a version, and Alembic
+  then tries to create them again and fails.
+
+### ⏸ Where this paused
+`env.py` and `alembic.ini` are wired. Still to run:
+
+```bash
+Remove-Item ctrlteach.db          # last time; history starts at zero
+uv run alembic revision --autogenerate -m "create users and profiles"
+uv run alembic upgrade head
+```
+
+Deleting rather than migrating on top is a *learning-repo* shortcut: the stale table holds
+one junk row, and `password_hash NOT NULL` can't be added to it without the nullable →
+backfill → tighten dance (SQLite won't add a NOT NULL column without a DEFAULT at all).
+
 ### 🔜 Next up
-L14 — `/register`: validate plaintext input, hash it, and create `User` + `Profile` in one transaction.
+Read the generated migration, apply it, drop `init_db()` from the lifespan, then POST to
+`/register` — and handle the duplicate-username case.
