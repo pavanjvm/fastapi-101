@@ -875,6 +875,95 @@ Deleting rather than migrating on top is a *learning-repo* shortcut: the stale t
 one junk row, and `password_hash NOT NULL` can't be added to it without the nullable →
 backfill → tighten dance (SQLite won't add a NOT NULL column without a DEFAULT at all).
 
+---
+
+## L15b — Finishing the migration, and the two `/register` bugs
+
+### Ran it
+
+```bash
+Remove-Item ctrlteach.db
+uv run alembic revision --autogenerate -m "create users and profiles"   # 320b5dbacda3
+uv run alembic upgrade head
+```
+
+`alembic_version` now holds exactly one row. `users` has all ten columns, `profiles` exists.
+
+### `init_db()` had to go — the concrete failure
+
+Not a style rule. With it still wired, on a fresh DB:
+
+1. app boots → `create_all()` creates `users`
+2. `alembic upgrade head` reads `alembic_version`, finds it empty, concludes nothing has run
+3. runs the first migration → `CREATE TABLE users` → **`table users already exists`**
+
+`create_all()` writes no version row, so Alembic has no way to learn the tables are already
+there. One owner of the schema, and it's Alembic now. Removed the call, the import, the
+function — and the `lifespan` wrapper with it, since that was all it contained.
+
+`lifespan` isn't obsolete; it's still the hook for a Redis pool or a model load. Schema
+creation just wasn't a legitimate use of it.
+
+### Bug 1 — a 500 *after* a successful insert
+
+```python
+class UserOut(BaseModel):
+    name: str          # required
+```
+
+`/register` never sets `name`, and `User.name` is nullable — so `user.name` is `None`.
+`response_model=UserOut` converts the returned object *after* `commit()` has already
+written the row. Pydantic sees `None` where it demanded a `str` and raises, nothing catches
+it → **500, with the user sitting in the database.**
+
+The fix is to make the schema agree with the model:
+
+```python
+class UserOut(BaseModel):
+    id: int
+    username: str          # non-null in the DB, and the field that actually identifies a user
+    name: str | None = None
+    model_config = {"from_attributes": True}
+```
+
+`username` was a separate improvement — the old response was `{"id": 1, "name": null}`,
+which tells the caller nothing. It doesn't replace the `name` fix; without both, it still
+500s.
+
+### Bug 2 — duplicate username
+
+```python
+session.add(user)
+try:
+    session.commit()
+except IntegrityError:
+    session.rollback()
+    raise HTTPException(status_code=409, detail="username taken")
+return user
+```
+
+**Why not a pre-check `SELECT`?** It's a race. Two requests can both run the SELECT, both
+see nothing, and both proceed. The `UNIQUE` constraint is the only check that can't be
+raced, because the database applies it at write time. Let it be the judge and handle the
+error it throws.
+
+`rollback()` is mandatory — after an `IntegrityError` the session is in a failed transaction
+and every later statement on it errors until it's reset.
+
+409 Conflict, not 400: the request was well-formed, it just collides with existing state.
+
+### ✅ Verified live
+
+```text
+POST /register {"username":"checkuser","password":"hunter22"}
+  → 201  {"id":1,"username":"checkuser","name":null}
+  → 409  {"detail":"username taken"}
+```
+
+### ⚠ Gotcha
+Deleting the `lifespan` function but leaving `lifespan=lifespan` in the `FastAPI(...)` call
+is a `NameError` at import — the app won't start at all. The mirror image of L7's silent
+failure: forgetting to *wire* a lifespan is quiet, forgetting to *unwire* one is loud.
+
 ### 🔜 Next up
-Read the generated migration, apply it, drop `init_db()` from the lifespan, then POST to
-`/register` — and handle the duplicate-username case.
+Login: verifying a password and issuing a JWT.

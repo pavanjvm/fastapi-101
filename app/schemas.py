@@ -2,7 +2,8 @@ from pydantic import BaseModel,Field
 
 class UserOut(BaseModel):
     id: int
-    name: str
+    username: str
+    name: str | None
     model_config = {"from_attributes":True}
 
 

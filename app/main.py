@@ -1,19 +1,15 @@
 from fastapi import FastAPI, Depends, HTTPException
-from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from app.schemas import UserOut,UserCreate
 
-from app.db import User,get_session, init_db
+from app.db import User,get_session
 from app.config import settings
 from app.security import hash_password
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    yield
 
-app = FastAPI(title = settings.app_name, lifespan=lifespan)
 
+app = FastAPI(title = settings.app_name)
 @app.get("/health")
 def health() -> dict[str,str]:
     return {"status":"ok"}
@@ -33,5 +29,10 @@ def register(payload:UserCreate, session:Session = Depends(get_session)):
     )
 
     session.add(user)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="username taken")
+    
     return user

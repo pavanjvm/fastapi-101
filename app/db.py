@@ -107,9 +107,7 @@ class Profile(Base):
 
 
 # 4. Lifecycle helpers.
-def init_db() -> None:
-    """Create any tables that don't exist yet. Idempotent."""
-    Base.metadata.create_all(bind=engine)
+
 
 
 def get_session():
