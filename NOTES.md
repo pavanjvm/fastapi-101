@@ -967,3 +967,35 @@ failure: forgetting to *wire* a lifespan is quiet, forgetting to *unwire* one is
 
 ### 🔜 Next up
 Login: verifying a password and issuing a JWT.
+
+---
+
+## L16 — JWT login
+
+### Why not server sessions?
+
+A server session requires the server to remember a session ID and its associated user. An
+in-memory store loses every login on restart and is not shared by multiple app instances.
+Production server sessions therefore need shared state such as Redis or a database.
+
+A signed token moves that state to the client. Every app instance can validate it using the
+same secret, without storing individual sessions. The main trade-off is revocation: a JWT
+normally remains valid until it expires unless the server introduces a denylist or other
+shared state.
+
+### Claims and confidentiality
+
+- `sub` is the **subject**: here, the user's ID as a string.
+- `exp` is the expiration timestamp, after which the token must be rejected.
+- A JWT is **signed, not encrypted**. Anyone holding it can read its payload, but changing
+  that payload invalidates the signature. Never put passwords, keys, or secrets in it.
+
+Unknown usernames and wrong passwords deliberately produce the same `401` message. Different
+messages would reveal which usernames are registered.
+
+### JWT versus Ctrl+Teach's custom token
+
+Real Ctrl+Teach uses hand-written HMAC-SHA256 bearer tokens with a `cts1` version marker and
+an `app:session` scope. JWT gains standard claims, ecosystem tooling, and interoperability.
+The custom format gains a smaller and more controlled contract, but gives up JWT conventions
+and off-the-shelf tooling.
